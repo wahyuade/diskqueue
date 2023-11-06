@@ -276,6 +276,40 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	var err error
 	var msgSize int32
 
+	// Fix: since the d.maxBytesPerFileRead may be changed during calling d.writeOne(),
+	// we must check the current position before next reading to avoid an unexpected EOF.
+	if d.readFileNum < d.writeFileNum {
+		if d.maxBytesPerFileRead <= 0 {
+			d.maxBytesPerFileRead = d.maxBytesPerFile
+			readFile := d.fileName(d.readFileNum)
+			stat, err := os.Stat(readFile)
+			if err != nil {
+				d.logf(ERROR, "DISKQUEUE(%s) unable to stat(%s) - %s", d.name, readFile, err)
+			} else {
+				d.maxBytesPerFileRead = stat.Size()
+			}
+		}
+
+		if d.readPos >= d.maxBytesPerFileRead {
+			if d.readFile != nil {
+				if err := d.readFile.Close(); err != nil {
+					d.logf(ERROR, "DISKQUEUE(%s) failed to close(%s) - %s", d.name, d.readFile.Name(), err)
+				}
+				if err := os.Remove(d.readFile.Name()); err != nil {
+					d.logf(ERROR, "DISKQUEUE(%s) failed to Remove(%s) - %s", d.name, d.readFile.Name(), err)
+				}
+				d.readFile = nil
+			}
+
+			// sync every time we start reading from a new file
+			if err = d.sync(); err != nil {
+				d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.name, err)
+			}
+			d.readFileNum++
+			d.readPos = 0
+		}
+	}
+
 	if d.readFile == nil {
 		curFileName := d.fileName(d.readFileNum)
 		d.readFile, err = os.OpenFile(curFileName, os.O_RDONLY, 0600)
