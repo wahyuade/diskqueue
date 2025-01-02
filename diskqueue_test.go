@@ -3,8 +3,10 @@ package diskqueue
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -771,5 +773,82 @@ func benchmarkDiskQueueGet(size int64, b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		<-dq.ReadChan()
+	}
+}
+
+func TestDiskQueue_ReadChan(t *testing.T) {
+	dataDir := "./testdata/dat"
+	err := os.MkdirAll(dataDir, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dataDir)
+
+	var (
+		megabyte int64 = 1 << 20
+		datCount       = 1112
+	)
+
+	dq := New("nsqio_diskqueue", dataDir, 128*megabyte, 0, int32(16*megabyte),
+		32*megabyte, time.Second*5, func(lvl LogLevel, f string, args ...interface{}) {
+			if lvl >= WARN {
+				t.Errorf(f, args)
+				return
+			}
+			log.Println(lvl, fmt.Sprintf(f, args...))
+		})
+
+	buf := make([]byte, 3231197)
+	n, err := rand.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(buf) {
+		t.Fatal("buf is not full")
+	}
+
+	pushExit := make(chan struct{})
+	go func() {
+		for i := 0; i < datCount; i++ {
+			if err := dq.Put(buf); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+		close(pushExit)
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(5)
+
+	var counter atomic.Int64
+
+	for i := 0; i < 5; i++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case data := <-dq.ReadChan():
+					if bytes.Compare(buf, data) != 0 {
+						t.Error("get corrupt msg")
+						return
+					}
+					counter.Add(1)
+				case <-pushExit:
+					if dq.Depth() == 0 {
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if counter.Load() != int64(datCount) {
+		t.Fatal("push message count not equals get message count")
+	}
+	if err := dq.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
